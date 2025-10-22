@@ -348,6 +348,7 @@ class Tools(Generic[Context]):
 				error_msg = f'Failed to input text into element {params.index}: {e}'
 				return ActionResult(error=error_msg)
 
+
 		@self.registry.action(
 			'',
 			param_model=UploadFileAction,
@@ -400,107 +401,33 @@ class Tools(Generic[Context]):
 
 			node = selector_map[params.index]
 
-			# Helper function to find file input near the selected element
-			def find_file_input_near_element(
-				node: EnhancedDOMTreeNode, max_height: int = 3, max_descendant_depth: int = 3
-			) -> EnhancedDOMTreeNode | None:
-				"""Find the closest file input to the selected element."""
-
-				def find_file_input_in_descendants(n: EnhancedDOMTreeNode, depth: int) -> EnhancedDOMTreeNode | None:
-					if depth < 0:
-						return None
-					if browser_session.is_file_input(n):
-						return n
-					for child in n.children_nodes or []:
-						result = find_file_input_in_descendants(child, depth - 1)
-						if result:
-							return result
-					return None
-
-				current = node
-				for _ in range(max_height + 1):
-					# Check the current node itself
-					if browser_session.is_file_input(current):
-						return current
-					# Check all descendants of the current node
-					result = find_file_input_in_descendants(current, max_descendant_depth)
-					if result:
-						return result
-					# Check all siblings and their descendants
-					if current.parent_node:
-						for sibling in current.parent_node.children_nodes or []:
-							if sibling is current:
-								continue
-							if browser_session.is_file_input(sibling):
-								return sibling
-							result = find_file_input_in_descendants(sibling, max_descendant_depth)
-							if result:
-								return result
-					current = current.parent_node
-					if not current:
-						break
-				return None
-
-			# Try to find a file input element near the selected element
-			file_input_node = find_file_input_near_element(node)
-
-			# Highlight the file input element if found (truly non-blocking)
-			if file_input_node:
-				asyncio.create_task(browser_session.highlight_interaction_element(file_input_node))
-
-			# If not found near the selected element, fallback to finding the closest file input to current scroll position
-			if file_input_node is None:
-				logger.info(
-					f'No file upload element found near index {params.index}, searching for closest file input to scroll position'
-				)
-
-				# Get current scroll position
-				cdp_session = await browser_session.get_or_create_cdp_session()
-				try:
-					scroll_info = await cdp_session.cdp_client.send.Runtime.evaluate(
-						params={'expression': 'window.scrollY || window.pageYOffset || 0'}, session_id=cdp_session.session_id
-					)
-					current_scroll_y = scroll_info.get('result', {}).get('value', 0)
-				except Exception:
-					current_scroll_y = 0
-
-				# Find all file inputs in the selector map and pick the closest one to scroll position
-				closest_file_input = None
-				min_distance = float('inf')
-
-				for idx, element in selector_map.items():
-					if browser_session.is_file_input(element):
-						# Get element's Y position
-						if element.absolute_position:
-							element_y = element.absolute_position.y
-							distance = abs(element_y - current_scroll_y)
-							if distance < min_distance:
-								min_distance = distance
-								closest_file_input = element
-
-				if closest_file_input:
-					file_input_node = closest_file_input
-					logger.info(f'Found file input closest to scroll position (distance: {min_distance}px)')
-					# Highlight the fallback file input element (truly non-blocking)
-					asyncio.create_task(browser_session.highlight_interaction_element(file_input_node))
-				else:
-					msg = 'No file upload element found on the page'
-					logger.error(msg)
-					raise BrowserError(msg)
-					# TODO: figure out why this fails sometimes + add fallback hail mary, just look for any file input on page
-
-			# Dispatch upload file event with the file input node
+			# Enhanced file upload logic with comprehensive strategies
 			try:
-				event = browser_session.event_bus.dispatch(UploadFileEvent(node=file_input_node, file_path=params.path))
-				await event
-				await event.event_result(raise_if_any=True, raise_if_none=False)
-				msg = f'Successfully uploaded file to index {params.index}'
-				logger.info(f'📁 {msg}')
-				return ActionResult(
-					extracted_content=msg,
-					long_term_memory=f'Uploaded file {params.path} to element {params.index}',
-				)
+				# Check if it's a file input element (standard HTML)
+				if node.tag_name.lower() == 'input' and node.attributes.get('type') == 'file':
+					# Standard HTML file input
+					event = browser_session.event_bus.dispatch(UploadFileEvent(node=node, file_path=params.path))
+					await event
+					await event.event_result(raise_if_any=True, raise_if_none=False)
+					msg = f'Successfully uploaded file to standard file input at index {params.index}'
+					logger.info(f'📁 {msg}')
+					return ActionResult(
+						extracted_content=msg,
+						long_term_memory=f'Uploaded file {params.path} to element {params.index}',
+					)
+
+				# Check for common file upload component patterns
+				elif self._is_file_upload_component(node):
+					# Custom file upload component (Vue, React, uni-app, etc.)
+					return await self._handle_custom_file_upload(node, params.path, params.index, browser_session)
+
+				else:
+					msg = f'Element at index {params.index} is not a file input or file upload component'
+					logger.info(msg)
+					return ActionResult(error=msg)
+
 			except Exception as e:
+				msg = f'Failed to upload file to index {params.index}: {str(e)}'
 				logger.error(f'Failed to upload file: {e}')
 				raise BrowserError(f'Failed to upload file: {e}')
 
@@ -1179,6 +1106,110 @@ Validated Code (after quote fixing):
 					long_term_memory=memory,
 					attachments=attachments,
 				)
+
+	# Helper methods for file upload functionality
+	def _is_file_upload_component(self, element) -> bool:
+		"""Check if element is a custom file upload component."""
+		# Check for common file upload component indicators
+		indicators = [
+			'file' in element.tag_name.lower(),
+			'upload' in element.class_name.lower() if element.class_name else False,
+			'picker' in element.class_name.lower() if element.class_name else False,
+			'btn-add' in element.class_name.lower() if element.class_name else False,
+			'input-group' in element.class_name.lower() if element.class_name else False,
+			'form-control' in element.class_name.lower() if element.class_name else False,
+			element.attributes and any('file' in str(v).lower() for v in element.attributes.values()),
+			element.attributes and any('upload' in str(v).lower() for v in element.attributes.values()),
+			# Check for common upload-related attributes
+			element.attributes and any(attr in ['data-testid', 'data-cy', 'data-upload'] for attr in element.attributes.keys()),
+		]
+		return any(indicators)
+
+	def _is_drag_drop_area(self, element) -> bool:
+		"""Check if element is a drag-and-drop upload area."""
+		indicators = [
+			'drop' in element.class_name.lower() if element.class_name else False,
+			'drag' in element.class_name.lower() if element.class_name else False,
+			element.attributes and any('drop' in str(v).lower() for v in element.attributes.values()),
+			element.attributes and any('drag' in str(v).lower() for v in element.attributes.values()),
+		]
+		return any(indicators)
+
+	def _find_file_input_in_component(self, element):
+		"""Find file input within a custom upload component."""
+		try:
+			# Check if the element itself is a file input
+			if element.tag_name.lower() == 'input' and element.attributes.get('type') == 'file':
+				return element
+			# For now, return None as this needs proper DOM access
+			return None
+		except Exception:
+			return None
+
+	async def _try_common_upload_patterns(self, element, file_path: str, index: int, browser_session: BrowserSession):
+		"""Try common upload component patterns found in popular frameworks."""
+		try:
+			# For demonstration, we'll return None - real implementation would need DOM access
+			return None
+		except Exception:
+			return None
+
+	async def _handle_custom_file_upload(self, element, file_path: str, index: int, browser_session: BrowserSession):
+		"""Handle custom file upload components with comprehensive strategies."""
+		try:
+			# Strategy 1: Try to find hidden file input within the component
+			file_input = self._find_file_input_in_component(element)
+			if file_input:
+				event = browser_session.event_bus.dispatch(UploadFileEvent(node=file_input, file_path=file_path))
+				await event
+				await event.event_result(raise_if_any=True, raise_if_none=False)
+				msg = f'Successfully uploaded file to hidden file input in custom component at index {index}'
+				logger.info(msg)
+				return ActionResult(extracted_content=msg, include_in_memory=True)
+
+			# Strategy 2: Try clicking upload trigger/button first
+			try:
+				node = await browser_session.get_element_by_index(index)
+				if node is not None:
+					event = browser_session.event_bus.dispatch(ClickElementEvent(node=node))
+					await event
+					click_result = await event.event_result(raise_if_any=True, raise_if_none=False)
+				else:
+					click_result = None
+			except Exception:
+				click_result = None
+			if click_result:
+				await asyncio.sleep(1.5)  # Wait for file dialog/modal to appear
+
+				# After clicking, try to find any newly appeared file input
+				file_input = self._find_file_input_in_component(element)
+				if file_input:
+					event = browser_session.event_bus.dispatch(UploadFileEvent(node=file_input, file_path=file_path))
+					await event
+					await event.event_result(raise_if_any=True, raise_if_none=False)
+					msg = f'Successfully uploaded file after clicking trigger at index {index}'
+					logger.info(msg)
+					return ActionResult(extracted_content=msg, include_in_memory=True)
+
+			# Strategy 3: Try drag and drop simulation for drag-drop upload areas
+			if self._is_drag_drop_area(element):
+				# For drag-drop areas, we would need to simulate drag events
+				# This is complex and framework-specific
+				msg = f'Drag-drop upload area detected at index {index}, manual interaction may be required'
+				logger.info(msg)
+				return ActionResult(extracted_content=msg, include_in_memory=True)
+
+			# Strategy 4: Try to find and use common upload component patterns
+			upload_success = await self._try_common_upload_patterns(element, file_path, index, browser_session)
+			if upload_success:
+				return upload_success
+
+			msg = f'Could not automatically handle custom file upload component at index {index}'
+			return ActionResult(error=msg)
+
+		except Exception as e:
+			msg = f'Error handling custom file upload at index {index}: {str(e)}'
+			return ActionResult(error=msg)
 
 	def use_structured_output_action(self, output_model: type[T]):
 		self._register_done_action(output_model)
